@@ -1,0 +1,133 @@
+--- a/include/rex/system/xevent.h
++++ b/include/rex/system/xevent.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <mutex>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -51,10 +52,13 @@
+   // permanently non-signalled event while the host event is signalled, which
+   // makes its polling loops spin.
+   void WaitCallback() override;
++  void SyncFromGuest() override;
+ 
+  private:
+   void SetGuestSignalState(bool signaled);
+ 
++  std::mutex state_lock_;
++  bool host_signaled_ = false;
+   bool manual_reset_ = false;
+   std::unique_ptr<rex::thread::Event> event_;
+ };
+--- a/include/rex/system/xobject.h
++++ b/include/rex/system/xobject.h
+@@ -209,6 +209,7 @@
+ 
+   // Called on successful wait.
+   virtual void WaitCallback() {}
++  virtual void SyncFromGuest() {}
+   virtual rex::thread::WaitHandle* GetWaitHandle() { return nullptr; }
+ 
+   // Creates the kernel object for guest code to use. Typically not needed.
+--- a/src/system/xevent.cpp
++++ b/src/system/xevent.cpp
+@@ -22,7 +22,12 @@
+ void XEvent::Initialize(bool manual_reset, bool initial_state) {
+   assert_false(event_);
+ 
++  manual_reset_ = manual_reset;
+   this->CreateNative<X_KEVENT>();
++  auto* header = guest_object<X_KEVENT>();
++  header->header.type = manual_reset ? 0 : 1;
++  header->header.signal_state = initial_state ? 1 : 0;
++  host_signaled_ = initial_state;
+ 
+   if (manual_reset) {
+     event_ = rex::thread::Event::CreateManualResetEvent(initial_state);
+@@ -48,6 +53,8 @@
+   }
+ 
+   bool initial_state = header->signal_state ? true : false;
++  host_signaled_ = initial_state;
++  SetNativePointer(memory()->HostToGuestVirtual(native_ptr), true);
+   if (manual_reset_) {
+     event_ = rex::thread::Event::CreateManualResetEvent(initial_state);
+   } else {
+@@ -84,38 +91,51 @@
+ }
+ 
+ void XEvent::WaitCallback() {
+-  // A wait on an auto-reset event clears it; a manual-reset event stays set.
+   if (!manual_reset_) {
++    std::lock_guard<std::mutex> lock(state_lock_);
++    host_signaled_ = false;
+     SetGuestSignalState(false);
+   }
+ }
+ 
++void XEvent::SyncFromGuest() {
++  if (!guest_object()) return;
++  std::lock_guard<std::mutex> lock(state_lock_);
++  const bool signaled = guest_object<X_KEVENT>()->header.signal_state != 0;
++  if (signaled == host_signaled_) return;
++  host_signaled_ = signaled;
++  if (signaled) event_->Set();
++  else event_->Reset();
++}
++
+ int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
++  std::lock_guard<std::mutex> lock(state_lock_);
++  const int32_t previous = host_signaled_ ? 1 : 0;
++  SetGuestSignalState(true);
++  host_signaled_ = true;
+   event_->Set();
+-  SetGuestSignalState(true);
+-  return 1;
++  return previous;
+ }
+ 
+ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
++  std::lock_guard<std::mutex> lock(state_lock_);
++  const int32_t previous = host_signaled_ ? 1 : 0;
+   event_->Pulse();
+-  // Best effort: the guest observes it as set, and a following wait clears it.
+-  SetGuestSignalState(true);
+-  if (!manual_reset_) {
+-    SetGuestSignalState(false);
+-  }
+-  return 1;
++  host_signaled_ = false;
++  SetGuestSignalState(false);
++  return previous;
+ }
+ 
+ int32_t XEvent::Reset() {
++  std::lock_guard<std::mutex> lock(state_lock_);
++  const int32_t previous = host_signaled_ ? 1 : 0;
+   event_->Reset();
++  host_signaled_ = false;
+   SetGuestSignalState(false);
+-  return 1;
++  return previous;
+ }
+ 
+-void XEvent::Clear() {
+-  event_->Reset();
+-  SetGuestSignalState(false);
+-}
++void XEvent::Clear() { Reset(); }
+ 
+ bool XEvent::Save(stream::ByteStream* stream) {
+   REXSYS_DEBUG("XEvent {:08X} ({})", handle(), manual_reset_ ? "manual" : "auto");
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -401,6 +401,8 @@
+     // TODO: assert if the type of the object != as_type
+     uint32_t handle = header->wait_list_blink;
+     auto object = kernel_state->object_table()->LookupObject<XObject>(handle);
++
++    if (object) object->SyncFromGuest();
+ 
+     // TODO(benvanik): assert nothing has been changed in the struct.
+     return object;

@@ -1,0 +1,109 @@
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdarg>
+ #include <cstring>
+ #include <sstream>
+@@ -48,6 +49,27 @@
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_BOOL(wo2_video_gpu_trace, false, "GPU/D3D12", "Trace WO2 YUV shader draws");
++
++REXCVAR_DECLARE(bool, wo2_queue_latency_trace);
++namespace {
++struct Wo2SubmissionTimer {
++  bool enabled;
++  std::chrono::steady_clock::time_point last;
++  Wo2SubmissionTimer() : enabled(REXCVAR_GET(wo2_queue_latency_trace)) {
++    if (enabled) last = std::chrono::steady_clock::now();
++  }
++  void Mark(unsigned phase) {
++    if (!enabled) return;
++    const auto now = std::chrono::steady_clock::now();
++    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now-last).count();
++    last = now;
++    using Callback = void (*)(unsigned, unsigned, unsigned);
++    static auto callback = reinterpret_cast<Callback>(
++        GetProcAddress(GetModuleHandleW(nullptr), "wo2_trace_queue_latency"));
++    if (callback && us >= 100) callback(24, phase, unsigned(std::min<int64_t>(us, UINT32_MAX)));
++  }
++};
++}
+ 
+ namespace rex::graphics::d3d12 {
+ 
+@@ -1907,12 +1929,14 @@
+     return;
+   }
+ 
++  Wo2SubmissionTimer wo2_swap_timer;
+   // In case the swap command is the only one in the frame.
+   if (!BeginSubmission(true)) {
+     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
+     return;
+   }
+ 
++  wo2_swap_timer.Mark(1);
+   // Obtain the actual swap source texture size (resolution-scaled if it's a
+   // resolve destination, or not otherwise).
+   D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_srv_desc;
+@@ -1930,6 +1954,7 @@
+         fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+     return;
+   }
++  wo2_swap_timer.Mark(2);
+   D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
+   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
+   // textures may be allocation-padded. Prefer the active frontbuffer region
+@@ -2253,6 +2278,7 @@
+         return true;
+       });
+ 
++  wo2_swap_timer.Mark(3);
+   // End the frame even if did not present for any reason (the image refresher
+   // was not called), to prevent leaking per-frame resources.
+   EndSubmission(true);
+@@ -3395,6 +3421,7 @@
+ }
+ 
+ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
++  Wo2SubmissionTimer wo2_submit_timer;
+   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+ 
+   // Make sure there is a command allocator to write commands to.
+@@ -3431,7 +3458,9 @@
+       active_occlusion_query_ = {};
+     }
+ 
++    wo2_submit_timer.Mark(10);
+     pipeline_cache_->EndSubmission();
++    wo2_submit_timer.Mark(11);
+ 
+     // Submit barriers now because resources with the queued barriers may be
+     // destroyed between frames.
+@@ -3448,10 +3477,13 @@
+         command_allocator_writable_first_->command_allocator;
+     command_allocator->Reset();
+     command_list_->Reset(command_allocator, nullptr);
++    wo2_submit_timer.Mark(12);
+     deferred_command_list_.Execute(command_list_, command_list_1_);
++    wo2_submit_timer.Mark(13);
+     command_list_->Close();
+     ID3D12CommandList* execute_command_lists[] = {command_list_};
+     direct_queue->ExecuteCommandLists(1, execute_command_lists);
++    wo2_submit_timer.Mark(14);
+     command_allocator_writable_first_->last_usage_submission = submission_current_;
+     if (command_allocator_submitted_last_) {
+       command_allocator_submitted_last_->next = command_allocator_writable_first_;
+@@ -3477,6 +3509,7 @@
+   if (is_closing_frame) {
+     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
+       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
++      wo2_submit_timer.Mark(15);
+     }
+     frame_open_ = false;
+     // Submission already closed now, so minus 1.

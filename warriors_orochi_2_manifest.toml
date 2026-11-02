@@ -1,0 +1,9 @@
+[project]
+name = "warriors_orochi_2"
+sdk_version = "0.10.0"
+game_root = "../Warriors Orochi 2 (USA) (En,Fr,De)"
+
+[entrypoint]
+file_path = "../Warriors Orochi 2 (USA) (En,Fr,De)/Warriors Orochi 2 Title Update #1/default.xex"
+out_directory_path = "generated/default"
+includes = ["warriors_orochi_2_config.toml"]

@@ -1,0 +1,357 @@
+--- a/src/graphics/d3d12/deferred_command_list.cpp
++++ b/src/graphics/d3d12/deferred_command_list.cpp
+@@ -16,6 +16,193 @@
+ #include <rex/graphics/flags.h>
+ #include <rex/math.h>
+ 
++//
++// WO2 diagnostic (patch: wo2-draw-gpu-timings)
++// Per-draw GPU timestamps, to tell a uniform per-draw cost from a few heavy
++// draws. Enabled by default while the patch is applied; disable by setting
++// wo2_draw_gpu_timings to false. Output: "[wo2-draw]" lines in the GPU log.
++//
++extern uint64_t wo2_draw_ps_hashes[];
++extern uint32_t wo2_draw_ps_hash_count;
++extern uint32_t wo2_draw_ps_texmasks[];
++
++REXCVAR_DEFINE_BOOL(wo2_draw_gpu_timings, true, "GPU/D3D12",
++                    "Log per-draw GPU timings (WO2 diagnostic)");
++
++namespace {
++
++class Wo2DrawTimer {
++ public:
++  static constexpr uint32_t kMaxDraws = 4096;
++  static constexpr uint32_t kSlots = 2;
++  static constexpr uint32_t kBuckets = 6;
++
++  ID3D12QueryHeap* heap = nullptr;
++  ID3D12Resource* readback = nullptr;
++  ID3D12Fence* fence = nullptr;
++  uint64_t freq = 0;
++  uint64_t signal_value = 0;
++  uint32_t slot = 0;
++  uint32_t draw_count = 0;
++  uint64_t pending_value[kSlots] = {};
++  bool pending_valid[kSlots] = {};
++  double sum_us = 0.0;
++  double max_us = 0.0;
++  uint64_t measured = 0;
++  uint64_t buckets[kBuckets] = {};
++  uint32_t draw_kind[kSlots][kMaxDraws] = {};
++  uint32_t draw_size[kSlots][kMaxDraws] = {};
++  uint64_t draw_ps_hash[kSlots][kMaxDraws] = {};
++  uint32_t draw_ps_texmask[kSlots][kMaxDraws] = {};
++  uint32_t heavy_logged = 0;
++  uint32_t frames = 0;
++
++  void Ensure(ID3D12Device* device, ID3D12CommandQueue* queue) {
++    if (heap) return;
++    uint64_t f = 0;
++    if (FAILED(queue->GetTimestampFrequency(&f)) || !f) return;
++    freq = f;
++    D3D12_QUERY_HEAP_DESC query_desc = {};
++    query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++    query_desc.Count = kMaxDraws * kSlots * 2;
++    if (FAILED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&heap)))) return;
++    D3D12_RESOURCE_DESC buffer_desc = {};
++    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++    buffer_desc.Width = uint64_t(kMaxDraws) * kSlots * 16;
++    buffer_desc.Height = 1;
++    buffer_desc.DepthOrArraySize = 1;
++    buffer_desc.MipLevels = 1;
++    buffer_desc.SampleDesc = {1, 0};
++    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    D3D12_HEAP_PROPERTIES heap_props = {};
++    heap_props.Type = D3D12_HEAP_TYPE_READBACK;
++    if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &buffer_desc,
++                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++                                               IID_PPV_ARGS(&readback)))) {
++      return;
++    }
++    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return;
++    REXGPU_INFO("[wo2-draw] per-draw GPU timings enabled, timestamp frequency {}", freq);
++  }
++
++  void BeginFrame() {
++    draw_count = 0;
++  }
++
++  void DrawBegin(ID3D12GraphicsCommandList* command_list, uint32_t kind, uint32_t count) {
++    if (!heap || draw_count >= kMaxDraws) return;
++    draw_kind[slot][draw_count] = kind;
++    draw_size[slot][draw_count] = count;
++    // Pixel shader hash recorded by the command processor for this draw.
++    draw_ps_hash[slot][draw_count] =
++        wo2_draw_ps_hashes[draw_count < wo2_draw_ps_hash_count ? draw_count : 0];
++    draw_ps_texmask[slot][draw_count] =
++        wo2_draw_ps_texmasks[draw_count < wo2_draw_ps_hash_count ? draw_count : 0];
++    command_list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP,
++                           slot * (kMaxDraws * 2) + draw_count * 2);
++  }
++
++  void DrawEnd(ID3D12GraphicsCommandList* command_list) {
++    if (!heap || draw_count >= kMaxDraws) return;
++    command_list->EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP,
++                           slot * (kMaxDraws * 2) + draw_count * 2 + 1);
++    ++draw_count;
++  }
++
++  void EndFrame(ID3D12GraphicsCommandList* command_list) {
++    if (!heap || !draw_count) return;
++    command_list->ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * (kMaxDraws * 2),
++                                   draw_count * 2, readback,
++                                   uint64_t(slot) * kMaxDraws * 16);
++  }
++
++  void SignalAndPoll(ID3D12CommandQueue* queue) {
++    if (!heap) return;
++    queue->Signal(fence, ++signal_value);
++    pending_value[slot] = signal_value;
++    pending_valid[slot] = true;
++    const uint64_t completed = fence->GetCompletedValue();
++    for (uint32_t i = 0; i < kSlots; ++i) {
++      if (!pending_valid[i] || pending_value[i] > completed) continue;
++      pending_valid[i] = false;
++      void* mapped = nullptr;
++      const size_t begin = size_t(i) * kMaxDraws * 16;
++      D3D12_RANGE range = {begin, begin + size_t(kMaxDraws) * 16};
++      if (FAILED(readback->Map(0, &range, &mapped))) continue;
++      const auto* stamps =
++          reinterpret_cast<const uint64_t*>(static_cast<const uint8_t*>(mapped) + begin);
++      for (uint32_t d = 0; d < kMaxDraws; ++d) {
++        const uint64_t t0 = stamps[d * 2];
++        const uint64_t t1 = stamps[d * 2 + 1];
++        if (!t1 || t1 <= t0) continue;
++        const double us = double(t1 - t0) * 1e6 / double(freq);
++        sum_us += us;
++        if (us > max_us) max_us = us;
++        ++measured;
++        if (us < 5.0) ++buckets[0];
++        else if (us < 15.0) ++buckets[1];
++        else if (us < 30.0) ++buckets[2];
++        else if (us < 60.0) ++buckets[3];
++        else if (us < 120.0) ++buckets[4];
++        else ++buckets[5];
++        // Log a sample of the heavy draws: kind 0 = indexed, 1 = instanced,
++        // size = index or vertex count, ps = pixel shader ucode hash.
++        if (us >= 500.0 && heavy_logged < 12) {
++          ++heavy_logged;
++          REXGPU_INFO("[wo2-heavy] kind={} size={} us={:.1f} ps={:016X} textures={:08X}",
++                      draw_kind[i][d], draw_size[i][d], us, draw_ps_hash[i][d],
++                      draw_ps_texmask[i][d]);
++        }
++      }
++      readback->Unmap(0, nullptr);
++      ++frames;
++    }
++    slot = (slot + 1) % kSlots;
++    if (frames >= 60) {
++      REXGPU_INFO(
++          "[wo2-draw] draws={} avg_us={:.1f} max_us={:.1f} buckets(<5,<15,<30,<60,<120,>120)="
++          "{},{},{},{},{},{}",
++          measured, measured ? sum_us / double(measured) : 0.0, max_us, buckets[0], buckets[1],
++          buckets[2], buckets[3], buckets[4], buckets[5]);
++      sum_us = 0.0;
++      max_us = 0.0;
++      measured = 0;
++      for (uint32_t b = 0; b < kBuckets; ++b) buckets[b] = 0;
++      frames = 0;
++    }
++  }
++};
++
++Wo2DrawTimer wo2_draw_timer;
++
++}  // namespace
++
++void Wo2DrawTimerEnsure(ID3D12Device* device, ID3D12CommandQueue* queue) {
++  if (!REXCVAR_GET(wo2_draw_gpu_timings)) return;
++  wo2_draw_timer.Ensure(device, queue);
++}
++void Wo2DrawTimerBegin() {
++  if (!REXCVAR_GET(wo2_draw_gpu_timings)) return;
++  wo2_draw_timer.BeginFrame();
++}
++void Wo2DrawTimerDrawBegin(ID3D12GraphicsCommandList* command_list, uint32_t kind,
++                           uint32_t count) {
++  if (!REXCVAR_GET(wo2_draw_gpu_timings)) return;
++  wo2_draw_timer.DrawBegin(command_list, kind, count);
++}
++void Wo2DrawTimerDrawEnd(ID3D12GraphicsCommandList* command_list) {
++  if (!REXCVAR_GET(wo2_draw_gpu_timings)) return;
++  wo2_draw_timer.DrawEnd(command_list);
++}
++void Wo2DrawTimerEnd(ID3D12GraphicsCommandList* command_list) {
++  if (!REXCVAR_GET(wo2_draw_gpu_timings)) return;
++  wo2_draw_timer.EndFrame(command_list);
++}
++void Wo2DrawTimerSignal(ID3D12CommandQueue* queue) {
++  if (!REXCVAR_GET(wo2_draw_gpu_timings)) return;
++  wo2_draw_timer.SignalAndPoll(queue);
++}
++
+ namespace rex::graphics::d3d12 {
+ 
+ DeferredCommandList::DeferredCommandList(const D3D12CommandProcessor& command_processor,
+@@ -36,6 +223,7 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+   const uintmax_t* stream = command_stream_.data();
+   size_t stream_remaining = command_stream_.size();
+   ID3D12PipelineState* current_pipeline_state = nullptr;
++  Wo2DrawTimerBegin();
+   while (stream_remaining != 0) {
+     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+     stream += kCommandHeaderSizeElements;
+@@ -88,16 +276,20 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+       case Command::kD3DDrawIndexedInstanced: {
+         if (current_pipeline_state != nullptr) {
+           auto& args = *reinterpret_cast<const D3DDrawIndexedInstancedArguments*>(stream);
++          Wo2DrawTimerDrawBegin(command_list, 0, args.index_count_per_instance);
+           command_list->DrawIndexedInstanced(args.index_count_per_instance, args.instance_count,
+                                              args.start_index_location, args.base_vertex_location,
+                                              args.start_instance_location);
++          Wo2DrawTimerDrawEnd(command_list);
+         }
+       } break;
+       case Command::kD3DDrawInstanced: {
+         if (current_pipeline_state != nullptr) {
+           auto& args = *reinterpret_cast<const D3DDrawInstancedArguments*>(stream);
++          Wo2DrawTimerDrawBegin(command_list, 1, args.vertex_count_per_instance);
+           command_list->DrawInstanced(args.vertex_count_per_instance, args.instance_count,
+                                       args.start_vertex_location, args.start_instance_location);
++          Wo2DrawTimerDrawEnd(command_list);
+         }
+       } break;
+       case Command::kD3DBeginQuery: {
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -49,6 +49,10 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ 
++REXCVAR_DEFINE_BOOL(wo2_skip_empty_fullscreen_draws, false, "GPU/D3D12",
++                    "Skip full-screen draws that cannot write anything (WO2)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(wo2_video_gpu_trace, false, "GPU/D3D12", "Trace WO2 YUV shader draws");
+ 
+ REXCVAR_DECLARE(bool, wo2_queue_latency_trace);
+@@ -71,6 +75,20 @@ struct Wo2SubmissionTimer {
+   }
+ };
+ }
++
++// WO2 diagnostic (patch: wo2-draw-gpu-timings) - implemented in
++// deferred_command_list.cpp at global scope.
++void Wo2DrawTimerEnsure(ID3D12Device* device, ID3D12CommandQueue* queue);
++void Wo2DrawTimerEnd(ID3D12GraphicsCommandList* command_list);
++void Wo2DrawTimerSignal(ID3D12CommandQueue* queue);
++
++// WO2 diagnostic: pixel shader ucode hash of each guest draw in the current
++// frame's deferred command stream, consumed by the per-draw GPU timer.
++uint64_t wo2_draw_ps_hashes[8192] = {};
++uint64_t wo2_empty_draws_skipped = 0;
++uint32_t wo2_draw_ps_texmasks[8192] = {};
++uint32_t wo2_draw_ps_hash_count = 0;
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -2317,6 +2335,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       wo2_ps->ucode_data_hash() == 0x9C016D19C75C8B76ull;
+   static thread_local uint64_t wo2_count = 0;
+   const bool wo2_log = wo2_draw && (++wo2_count <= 3 || wo2_count % 300 == 0);
++  // WO2 diagnostic: state of the constant-colour full-screen shader.
++  if (wo2_ps && wo2_ps->ucode_data_hash() == 0xA4A965C189287B99ull) {
++    static uint32_t wo2_const_logged = 0;
++    if (wo2_const_logged < 12) {
++      ++wo2_const_logged;
++      REXGPU_INFO(
++          "[wo2-const] blend={:08X} blend1={:08X} mask={:08X} mode={:08X} surface={:08X} depthctl={:08X} depthinfo={:08X}",
++          regs[XE_GPU_REG_RB_BLENDCONTROL0], regs[XE_GPU_REG_RB_BLENDCONTROL0 + 1],
++          regs[XE_GPU_REG_RB_COLOR_MASK], regs[XE_GPU_REG_RB_MODECONTROL],
++          regs[XE_GPU_REG_RB_SURFACE_INFO], regs[XE_GPU_REG_RB_DEPTHCONTROL],
++          regs[XE_GPU_REG_RB_DEPTH_INFO]);
++    }
++  }
+   if (wo2_log) {
+     REXGPU_INFO("[video-gpu] draw={} indices={} mode={:08X} surface={:08X} mask={:08X} depth={:08X}",wo2_count,index_count,regs[XE_GPU_REG_RB_MODECONTROL],regs[XE_GPU_REG_RB_SURFACE_INFO],regs[XE_GPU_REG_RB_COLOR_MASK],regs[XE_GPU_REG_RB_DEPTHCONTROL]);
+     for (uint32_t slot = 0; slot < 3; ++slot) {
+@@ -2414,6 +2445,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     return false;
+   }
+ 
++  // WO2 (patch: wo2-skip-empty-fullscreen-draws)
++  // The title issues full-screen triangle draws that cannot write anything:
++  // no colour channels are unmasked (RB_COLOR_MASK is 0), depth test and write
++  // are disabled, stencil is disabled, the pixel shader does not memexport and
++  // no occlusion query is active. The draw is a no-op, but the emulator would
++  // still run a full-screen pass for it (measured at 0.7-0.9 ms each, 10-20 per
++  // frame in battle). Everything that affects state has already been done by
++  // Update above, so the draw itself can be dropped.
++  if (REXCVAR_GET(wo2_skip_empty_fullscreen_draws) && normalized_color_mask == 0 &&
++      !normalized_depth_control.z_enable && !normalized_depth_control.z_write_enable &&
++      !normalized_depth_control.stencil_enable && !memexport_used &&
++      !active_occlusion_query_.valid) {
++    ++wo2_empty_draws_skipped;
++    if ((wo2_empty_draws_skipped % 600) == 0) {
++      REXGPU_INFO("[wo2-skip] empty full-screen draws skipped total={}", wo2_empty_draws_skipped);
++    }
++    return true;
++  }
++
+   // Create the pipeline (for this, need the actually used render target formats
+   // from the render target cache), translating the shaders - doing this now to
+   // obtain the used textures.
+@@ -2675,6 +2725,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     PROFILE_DRAW_CALL();
+     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+     if (wo2_log) REXGPU_INFO("[video-gpu] emit_nonindexed count={}",primitive_processing_result.host_draw_vertex_count);
++    if (wo2_draw_ps_hash_count < 8192) {
++      wo2_draw_ps_texmasks[wo2_draw_ps_hash_count] =
++          pixel_shader ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0;
++      wo2_draw_ps_hashes[wo2_draw_ps_hash_count++] =
++          pixel_shader ? pixel_shader->ucode_data_hash() : 0;
++    }
+     deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
+                                             0, 0);
+   } else {
+@@ -2735,6 +2791,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     PROFILE_DRAW_CALL();
+     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+     if (wo2_log) REXGPU_INFO("[video-gpu] emit_indexed");
++    if (wo2_draw_ps_hash_count < 8192) {
++      wo2_draw_ps_texmasks[wo2_draw_ps_hash_count] =
++          pixel_shader ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0;
++      wo2_draw_ps_hashes[wo2_draw_ps_hash_count++] =
++          pixel_shader ? pixel_shader->ucode_data_hash() : 0;
++    }
+     deferred_command_list_.D3DDrawIndexedInstanced(
+         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+     if (scratch_index_buffer != nullptr) {
+@@ -3350,6 +3412,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     // end of the submission (when async pipeline creation requests are
+     // fulfilled).
+     deferred_command_list_.Reset();
++    // WO2 diagnostic: the per-draw pixel shader hashes belong to this stream.
++    wo2_draw_ps_hash_count = 0;
+ 
+     // Reset cached state of the command list.
+     ff_viewport_update_needed_ = true;
+@@ -3476,13 +3540,16 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+         command_allocator_writable_first_->command_allocator;
+     command_allocator->Reset();
+     command_list_->Reset(command_allocator, nullptr);
++    Wo2DrawTimerEnsure(provider.GetDevice(), direct_queue);
+     wo2_submit_timer.Mark(12);
+     deferred_command_list_.Execute(command_list_, command_list_1_);
++    Wo2DrawTimerEnd(command_list_);
+     wo2_submit_timer.Mark(13);
+     command_list_->Close();
+     wo2_submit_timer.Mark(16);
+     ID3D12CommandList* execute_command_lists[] = {command_list_};
+     direct_queue->ExecuteCommandLists(1, execute_command_lists);
++    Wo2DrawTimerSignal(direct_queue);
+     wo2_submit_timer.Mark(17);
+     wo2_submit_timer.Mark(14);
+     command_allocator_writable_first_->last_usage_submission = submission_current_;

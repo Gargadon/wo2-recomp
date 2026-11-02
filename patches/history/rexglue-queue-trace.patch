@@ -1,0 +1,47 @@
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -8,6 +8,20 @@
+  *
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
++
++#if defined(_WIN32)
++#include <Windows.h>
++namespace {
++void Wo2TraceGpuWrite(uint32_t kind, uint32_t address, uint32_t stored) {
++  using Callback = void (*)(unsigned, unsigned, unsigned);
++  static auto callback = reinterpret_cast<Callback>(
++      GetProcAddress(GetModuleHandleW(nullptr), "wo2_trace_gpu_write"));
++  if (callback) callback(kind, address, stored);
++}
++}
++#else
++static void Wo2TraceGpuWrite(uint32_t, uint32_t, uint32_t) {}
++#endif
+ 
+ #include <algorithm>
+ #include <cinttypes>
+@@ -367,6 +381,7 @@
+       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
+       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
+       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
++      Wo2TraceGpuWrite(12, mem_addr, __builtin_bswap32(value));
+     }
+   } else {
+     switch (index) {
+@@ -1109,6 +1124,7 @@
+     auto addr = write_addr & ~0x3;
+     write_data = GpuSwap(write_data, endianness);
+     memory::store(memory_->TranslatePhysical(addr), write_data);
++    Wo2TraceGpuWrite(10, addr, write_data);
+     write_addr += 4;
+   }
+ 
+@@ -1215,6 +1231,7 @@
+   address &= ~0x3;
+   data_value = GpuSwap(data_value, endianness);
+   memory::store(memory_->TranslatePhysical(address), data_value);
++  Wo2TraceGpuWrite(11, address, data_value);
+   return true;
+ }
+ 

@@ -1,0 +1,71 @@
+# ---------------------------------------------------------------------------
+# Warriors Orochi 2 recompilation project
+# ---------------------------------------------------------------------------
+
+# Build output: CMake/Ninja tree, final binaries, the runtime TOML written next
+# to the executable, and the rotated logs. Everything here is recreated by
+# build.ps1.
+out/
+
+# Code produced by `rexglue codegen` (about 70 MB of .cpp/.h plus stamps).
+# build.ps1 always regenerates it from warriors_orochi_2_manifest.toml and
+# warriors_orochi_2_config.toml, so it does not belong in the history.
+#
+# Exception: generated/rexglue.cmake must stay tracked, because the project's
+# CMakeLists.txt includes it at configure time (it is what locates the SDK and
+# declares the recompilation settings). Without it a fresh checkout cannot even
+# configure. generated/default/sources.cmake is intentionally NOT tracked: it is
+# only included when it exists, and it lists sources that codegen has not
+# produced yet.
+generated/*
+!generated/rexglue.cmake
+
+# Local scratch: extracted Title Update copies, diagnostics (alloc-probe.txt,
+# write-probe.txt), config backups, window screenshots, ad-hoc scripts.
+tmp/
+
+# Traces and profiler artifacts (WPA/GPUView, queue traces, perf CSVs).
+*.etl
+*.etl.binaries/
+*.etl.EmbeddedPdbs/
+*.etl.NGENPDB/
+*.wprp
+*.csv
+*.png
+
+# Project artwork is tracked even though screenshots are not.
+!docs/*.png
+
+# codegen state (the rest of generated/ is covered above).
+codegen.partition.json
+
+# Logs produced when running outside out/.
+*.log
+
+# Runtime configuration written next to the executable if a build ever places
+# it in the source tree.
+warriors_orochi_2.toml
+*.toml.bak
+
+# Editors / IDEs.
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+
+# CMake leftovers if the tree is configured in place (the presets use out/).
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# OS / misc.
+Thumbs.db
+desktop.ini
+.DS_Store
+*~

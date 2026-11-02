@@ -1,0 +1,81 @@
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -26,6 +26,7 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
++#include <chrono>
+ #include <cstring>
+ #include <string_view>
+ 
+@@ -51,6 +52,38 @@
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
++REXCVAR_DEFINE_BOOL(wo2_queue_latency_trace, false, "GPU", "Trace WO2 submissions and slow type-3 packets (restart required)");
++namespace {
++void Wo2TraceLatency(uint32_t kind, uint32_t detail, uint32_t value) {
++#if defined(_WIN32)
++  using Callback = void (*)(unsigned, unsigned, unsigned);
++  static auto callback = reinterpret_cast<Callback>(
++      GetProcAddress(GetModuleHandleW(nullptr), "wo2_trace_queue_latency"));
++  if (callback) callback(kind, detail, value);
++#endif
++}
++bool Wo2LatencyEnabled() {
++  static const bool enabled = REXCVAR_GET(wo2_queue_latency_trace);
++  return enabled;
++}
++struct Wo2PacketTimer {
++  uint32_t packet;
++  bool enabled;
++  std::chrono::steady_clock::time_point start;
++  explicit Wo2PacketTimer(uint32_t header)
++      : packet(header), enabled((header >> 30) == 3 && Wo2LatencyEnabled()) {
++    if (enabled) start = std::chrono::steady_clock::now();
++  }
++  ~Wo2PacketTimer() {
++    if (!enabled) return;
++    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
++        std::chrono::steady_clock::now() - start).count();
++    if (us >= 1000) Wo2TraceLatency(21, packet, uint32_t(std::min<int64_t>(us, UINT32_MAX)));
++  }
++};
++}
++
++
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
+@@ -342,6 +375,7 @@
+ }
+ 
+ void CommandProcessor::UpdateWritePointer(uint32_t value) {
++  if (Wo2LatencyEnabled()) Wo2TraceLatency(20, value, 0);
+   write_ptr_index_ = value;
+   write_ptr_index_event_->Set();
+ }
+@@ -630,6 +664,7 @@
+ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
+   SCOPE_profile_cpu_f("gpu");
+ 
++  if (Wo2LatencyEnabled()) Wo2TraceLatency(22, read_index, write_index);
+   // Execute commands!
+   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
+   reader.set_read_offset(read_index * sizeof(uint32_t));
+@@ -644,6 +679,7 @@
+   } while (reader.read_count());
+ 
+   OnPrimaryBufferEnd();
++  if (Wo2LatencyEnabled()) Wo2TraceLatency(23, read_index, write_index);
+ 
+   return write_index;
+ }
+@@ -679,6 +715,7 @@
+ 
+ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
++  Wo2PacketTimer wo2_packet_timer(packet);
+   const uint32_t packet_type = packet >> 30;
+   if (packet == 0) {
+     return true;

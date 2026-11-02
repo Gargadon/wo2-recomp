@@ -1,0 +1,3 @@
+# SDK patches applied by build.ps1 before configuring, in this order.
+# Paths are relative to the wo2-recomp directory.
+patches/rexglue-sdk-wo2.patch

@@ -1,0 +1,26 @@
+# Line endings.
+#
+# The patch files are applied with `git apply`, and CRLF in a patch breaks the
+# context matching, so they must always be checked out with LF. The shell scripts
+# are the same: a CRLF shebang line does not run under bash.
+* text=auto eol=lf
+*.patch text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Windows-native scripts keep their native endings.
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets.
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary

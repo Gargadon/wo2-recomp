@@ -1,0 +1,97 @@
+# Warriors Orochi 2 - recompilation config for the TU1-patched image.
+#
+# Image: Warriors Orochi 2 Title Update #1/default.xex + default.xexp
+#   codegen applies the XEXP (code 82110000-824BFAC4, entry 823028F8);
+#   the runtime only applies a patch it finds as <module>.xexp, so the same
+#   default.xexp must also sit next to game:\default.xex.
+#
+# Rebuilt from scratch against the TU1 image. Every entry belongs to one of
+# three groups, and each one was verified against the patched image:
+#   * analysis: tail-branch targets the linear scan cannot attribute
+#   * thunks:   MSVC adjustor thunks (addi r3,r3,-N; b target), only reachable
+#               through vtables, so discovery never marks them
+#   * vtable:   function pointers stored in .rdata/data that the vtable scanner
+#               misses (verified: target is not already a function, has no
+#               loc_ label, and follows a terminator instruction)
+
+[functions]
+# --- analysis: "unresolved call, target not in any function" ---
+0x8234F280 = {}	# b 0x8234F280 from 0x8234FBEC
+0x823473C0 = {}	# b 0x823473C0 from 0x8234FBC4
+
+# --- adjustor thunks reachable only from vtables ---
+0x821B6DA8 = {}	# addi r3,r3,1; b 0x821C16D0
+0x821B6DB0 = {}	# addi r3,r3,1; b 0x821C1848
+0x821B6DB8 = {}	# addi r3,r3,1; b 0x821C1390
+0x821B6DC0 = {}	# addi r3,r3,1; b 0x821B6B68
+0x821CE4F0 = {}	# addi r3,r3,4; b 0x821CE50C
+0x8234FBA8 = {}	# addi r3,r3,-4; b 0x8234F278
+0x8234FBB0 = {}	# addi r3,r3,-16; b 0x8234F550
+0x8234FBE0 = {}	# addi r3,r3,-16; b 0x8234F300
+0x82350C48 = {}	# addi r3,r3,-16; b 0x8234FC10
+0x82351F30 = {}	# addi r3,r3,-16; b 0x82351E18
+0x82351F48 = {}	# addi r3,r3,-16; b 0x82351BD8
+0x82351F58 = {}	# addi r3,r3,-16; b 0x82351978
+0x82351F60 = {}	# addi r3,r3,-16; b 0x82351990
+0x82351F68 = {}	# addi r3,r3,-16; b 0x82351C38
+0x82351F78 = {}	# addi r3,r3,-16; b 0x82351B08
+
+# --- function pointers stored in data ---
+0x8211FF78 = {}	# data ref 0x820E8BC0
+0x82131CF0 = {}	# data ref 0x820F5298
+0x82139008 = {}	# data ref 0x820F4B04
+0x82139020 = {}	# data ref 0x820F4B08
+0x82139038 = {}	# data ref 0x820F4B0C
+0x82139050 = {}	# data ref 0x820F4B10
+0x8213B018 = {}	# data ref 0x820F4BCC
+0x8213B030 = {}	# data ref 0x820F4BF0
+0x8213B048 = {}	# data ref 0x820F4BF8
+0x8213E1E0 = {}	# data ref 0x820F48FC
+0x8213FBA0 = {}	# data ref 0x820F499C
+0x821410F0 = {}	# data ref 0x820F49F0
+0x82141130 = {}	# data ref 0x820F49B4
+0x82141D18 = {}	# data ref 0x820F4A0C
+0x82141DF0 = {}	# data ref 0x820F4A1C
+0x82141E80 = {}	# data ref 0x820F4A28
+0x82141EC0 = {}	# data ref 0x820F4760,0x820F4788
+0x8216D260 = {}	# data ref 0x820F66E4
+0x8230C898 = {}	# data ref 0x820F6A30
+0x8230E03C = {}	# data ref 0x820F6A78
+0x8230E1B4 = {}	# data ref 0x820F6A88
+0x8234B320 = {}	# data ref 0x8209C380,0x8209C3E0,0x8209C628
+0x8234B368 = {}	# data ref 0x8209C374,0x8209C3D4,0x8209C61C
+0x82365FEC = {}	# data ref 0x820F6AB0
+0x82366354 = {}	# data ref 0x820F6AC8
+0x823663E8 = {}	# data ref 0x820F6AE0
+0x82366648 = {}	# data ref 0x820F6AF8
+0x823668F0 = {}	# data ref 0x820F6B10
+0x82366E68 = {}	# data ref 0x820F6B28
+0x82367304 = {}	# data ref 0x820F6B40
+0x823673DC = {}	# data ref 0x820F6B58
+0x823674BC = {}	# data ref 0x820F6B70
+0x8236775C = {}	# data ref 0x820F6B88
+0x82367AB8 = {}	# data ref 0x820F6BA0
+0x82370150 = {}	# data ref 0x8209FC80,0x8209FCE0
+0x82370170 = {}	# data ref 0x8209FCE4
+0x82370190 = {}	# data ref 0x8209FCDC
+0x823701B0 = {}	# data ref 0x8209FC84,0x8209FCE8
+0x82370330 = {}	# data ref 0x8209FD30
+0x82370350 = {}	# data ref 0x8209FD34
+0x82370370 = {}	# data ref 0x8209FD38
+0x82370390 = {}	# data ref 0x8209FD3C
+0x823703B0 = {}	# data ref 0x8209FD40
+0x823703D0 = {}	# data ref 0x8209FD44
+0x823703F0 = {}	# data ref 0x8209FD48
+0x82370410 = {}	# data ref 0x8209FD4C
+0x82370430 = {}	# data ref 0x8209FD50
+0x82370450 = {}	# data ref 0x8209FD54
+0x82377490 = {}	# data ref 0x8209FC6C,0x8209FCBC
+0x823825F8 = {}	# data ref 0x820F6BB0,0x820F6BB8
+
+
+# TU1: verified bl VdSwap at 8231B874 (return address 8231B878).
+# Do not restore the unpatched game's queue/video hook addresses.
+[[midasm_hook]]
+address = 0x8231B874
+name = "wo2_count_frame"
+registers = []
